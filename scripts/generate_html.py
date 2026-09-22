@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generate_html.py  (v2.1)
+generate_html.py  (v2.4)
 ========================
 把 prepare_terrain_data.py 生成的 terrain.json 渲染成自包含 Three.js 三维地形 HTML。
 
@@ -145,7 +145,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <span>高程范围</span><b>{{ "%.0f"|format(min_elev) }} – {{ "%.0f"|format(max_elev) }} m</b>
     <span>相对高差</span><b>{{ "%.0f"|format(max_elev-min_elev) }} m</b>
     <span>主峰海拔</span><b>{{ "%.0f"|format(peak_elev) }} m</b>
-    <span>水平分辨率</span><b>{{ "%.1f"|format(resolution) }} m/px</b>
+    <span>贴图分辨率</span><b>{{ "%.1f"|format(resolution) }} m/px</b>
   </div>
   <div class="src">
     高程：{{ src_dem }}<br>
@@ -165,6 +165,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="btns">
     <button id="modeBtn" class="{{ 'on' if not has_sat else '' }}">{{ '影像贴图' if has_sat else '高程设色' }}</button>
+  </div>
+  <div class="btns">
+    <button id="rotateBtn">自动旋转</button>
+    <button id="shotBtn">导出 PNG</button>
+  </div>
+  <div class="btns">
+    <button id="contourBtn" class="on">等高线</button>
     <button id="wireBtn">网格线</button>
   </div>
   <label class="chk"><input id="lmToggle" type="checkbox" checked> 显示地标标注</label>
@@ -218,7 +225,7 @@ function lonToX(lon){ return (((lon + 180) / 360 - MX0) / (MX1 - MX0) - 0.5) * W
 function latToZ(lat){ return ((mercY(lat) - MY0) / (MY1 - MY0) - 0.5) * WORLD; }
 function midY(){ return (META.min_elev + META.max_elev) * 0.5 * S * exag; }
 
-let scene, camera, renderer, controls, terrain, plinth, baseElev = null;
+let scene, camera, renderer, controls, terrain, plinth, baseElev = null, contourMesh = null;
 
 function setMsg(t, isErr){
   const l = document.getElementById('lmsg');
@@ -228,7 +235,27 @@ function setMsg(t, isErr){
   if (isErr) document.getElementById('spin').style.display = 'none';
 }
 
-function parseDEM(url){
+// ---- 高程解码：优先用 Web Worker 异步解码（避免大网格 getImageData 阻塞主线程）----
+const __DEM_WORKER_SRC = `
+self.onmessage = async (ev) => {
+  const {dataURL, W, H} = ev.data;
+  try {
+    const blob = await (await fetch(dataURL)).blob();
+    const bmp = await createImageBitmap(blob);
+    const c = new OffscreenCanvas(W, H);
+    const ctx = c.getContext('2d');
+    ctx.drawImage(bmp, 0, 0, W, H);
+    const d = ctx.getImageData(0, 0, W, H).data;
+    const e = new Float32Array(W * H);
+    for (let i = 0, p = 0; i < W * H; i++, p += 4) e[i] = (d[p] * 256 + d[p + 1] + d[p + 2] / 256) - 32768;
+    self.postMessage({e: e.buffer}, [e.buffer]);
+  } catch (err) {
+    self.postMessage({error: String((err && err.message) || err)});
+  }
+};
+`;
+
+function decodeDEMSync(url){
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -246,6 +273,31 @@ function parseDEM(url){
     img.onerror = () => reject(new Error('高程贴图解码失败'));
     img.src = url;
   });
+}
+
+function parseDEM(url){
+  // 支持 Web Worker + OffscreenCanvas 时异步解码；否则/失败(含超时)时回退主线程同步解码
+  if (typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined' && typeof createImageBitmap === 'function'){
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let worker = null;
+      const fallback = () => { if (!done){ done = true; decodeDEMSync(url).then(resolve, reject); } };
+      try {
+        const blob = new Blob([__DEM_WORKER_SRC], {type: 'text/javascript'});
+        worker = new Worker(URL.createObjectURL(blob));
+        const timer = setTimeout(() => { try { worker.terminate(); } catch(e){} fallback(); }, 8000);
+        worker.onmessage = (ev) => {
+          if (done) return;
+          if (ev.data.error){ clearTimeout(timer); try { worker.terminate(); } catch(e){} fallback(); return; }
+          done = true; clearTimeout(timer); try { worker.terminate(); } catch(e){}
+          resolve(new Float32Array(ev.data.e));
+        };
+        worker.onerror = () => { clearTimeout(timer); fallback(); };
+        worker.postMessage({dataURL: url, W, H});
+      } catch(e){ fallback(); }
+    });
+  }
+  return decodeDEMSync(url);
 }
 
 function sampleElev(lat, lon){
@@ -293,7 +345,7 @@ async function init(){
   scene.fog = new THREE.Fog(0x0d1117, WORLD * 2.0, WORLD * 6.0);
 
   camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 1, WORLD * 30);
-  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setSize(innerWidth, innerHeight);
   document.getElementById('app').appendChild(renderer.domElement);
@@ -354,6 +406,52 @@ function buildTerrain(){
   terrain = new THREE.Mesh(geo, mat);
   terrain.userData.map = map;
   scene.add(terrain);
+  buildContours(geo);  // 等高线叠加层（与地形共用几何，随夸张系数联动）
+}
+
+// ---- 等高线叠加：由高程数组生成透明描线纹理，叠在地形上方（卫星/设色两种模式都生效）----
+function buildContours(geo){
+  const lo = META.min_elev, hi = Math.max(META.max_elev, lo + 1);
+  const span = hi - lo;
+  // 自动选"好看"的等高距：约 12 条线，取整到 10/20/50/100/200/500
+  const rawStep = span / 12;
+  const mag = Math.pow(10, Math.floor(Math.log10(Math.max(1, rawStep))));
+  const norm = rawStep / mag;
+  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+  const resM = META.resolution_m || (span / Math.max(W, H));
+  const band = Math.max(1.0, step * 0.04, resM * 1.6);  // 线宽≈1.6 像素(米)
+
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(W, H);
+  const data = img.data;
+  for (let i = 0; i < W * H; i++){
+    const e = baseElev[i];
+    let m = ((e - lo) % step + step) % step;
+    const near = Math.min(m, step - m);
+    const idx = i * 4;
+    if (near < band){
+      const a = (1 - near / band) * 120;
+      data[idx] = 18; data[idx + 1] = 18; data[idx + 2] = 18; data[idx + 3] = a;
+    } else {
+      data[idx + 3] = 0;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  const mat = new THREE.MeshBasicMaterial({
+    map: tex, transparent: true, depthWrite: false,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+  });
+  contourMesh = new THREE.Mesh(geo, mat);
+  contourMesh.renderOrder = 2;
+  contourMesh.visible = true;
+  scene.add(contourMesh);
+  const cb = document.getElementById('contourBtn');
+  if (cb) cb.classList.toggle('on', true);
 }
 
 function applyHeights(geo){
@@ -505,6 +603,30 @@ wireBtn.addEventListener('click', () => {
   terrain.material.wireframe = !terrain.material.wireframe;
   wireBtn.classList.toggle('on', terrain.material.wireframe);
 });
+const contourBtn = document.getElementById('contourBtn');
+contourBtn.addEventListener('click', () => {
+  if (!contourMesh) return;
+  contourMesh.visible = !contourMesh.visible;
+  contourBtn.classList.toggle('on', contourMesh.visible);
+});
+const rotateBtn = document.getElementById('rotateBtn');
+let autoRot = false;
+rotateBtn.addEventListener('click', () => {
+  autoRot = !autoRot;
+  controls.autoRotate = autoRot;
+  controls.autoRotateSpeed = 0.9;
+  rotateBtn.classList.toggle('on', autoRot);
+  rotateBtn.textContent = autoRot ? '停止旋转' : '自动旋转';
+});
+const shotBtn = document.getElementById('shotBtn');
+shotBtn.addEventListener('click', () => {
+  renderer.render(scene, camera);   // 确保截到当前帧
+  const url = renderer.domElement.toDataURL('image/png');
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = (META.place || 'terrain') + '_3d.png';
+  document.body.appendChild(a); a.click(); a.remove();
+});
 document.getElementById('lmToggle').addEventListener('change', e => { showLM = e.target.checked; });
 document.getElementById('fold').addEventListener('click', e => {
   const p = document.getElementById('info');
@@ -635,7 +757,7 @@ def render(data: dict, out_path: str, exaggeration: float | None = None,
         width_m=meta["width_m"], height_m=meta["height_m"],
         min_elev=meta["min_elev"], max_elev=meta["max_elev"],
         peak_elev=meta["peak_elev"], peak_label=peak_label,
-        resolution=meta.get("resolution_m", 0),
+        resolution=meta.get("sat_resolution_m") or meta.get("resolution_m", 0),
         exaggeration=exaggeration,
         has_sat=has_sat,
         dem_b64=data["dem_b64"],

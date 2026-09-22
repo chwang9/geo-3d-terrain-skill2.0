@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-prepare_terrain_data.py  (v2.1)
+prepare_terrain_data.py  (v2.4)
 ===============================
 三维真实地形数据准备脚本：输入地名（或直接给经纬度），自动
   1. 地理编码（多源兜底 + 结果打分）
   2. 下载 AWS Terrarium DEM 高程瓦片并拼接
-  3. 下载 Esri World Imagery 卫星影像（默认超采样 2 级后裁切对齐）
+  3. 下载 Esri World Imagery 卫星影像（按目标纹理分辨率自动选 zoom，裁切对齐；可叠微 hillshade / 锐化，默认 JPEG 编码、可选 WebP）
   4. 从 Overpass(OSM) 获取地标 POI
 输出一个 terrain.json，供 generate_html.py 渲染成自包含 HTML。
 
@@ -45,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageEnhance
 from requests.adapters import HTTPAdapter
 
 try:
@@ -57,6 +57,7 @@ UA = "geo-3d-terrain/2.0 (terrain visualization skill)"
 MIN_ZOOM, MAX_DEM_ZOOM, MAX_SAT_ZOOM = 3, 15, 19
 CACHE_DIR = Path(os.environ.get("GEO3D_CACHE", Path.home() / ".cache" / "geo-3d-terrain" / "tiles"))
 USE_CACHE = True
+NODATA_TTL = 24 * 3600  # 无数据(404)缓存有效期(秒)：过期后重新请求，避免瞬时限流 404 被记成永久无数据
 
 
 def log(msg: str) -> None:
@@ -98,21 +99,37 @@ def _cache_path(kind: str, z: int, x: int, y: int) -> Path:
     return CACHE_DIR / kind / str(z) / str(x) / f"{y}.bin"
 
 
+def _cache_age(cp: Path) -> float:
+    """缓存文件已存活秒数（用于无数据 TTL 判断）。"""
+    try:
+        return time.time() - cp.stat().st_mtime
+    except Exception:
+        return 1e9
+
+
 def fetch_bytes(url: str, kind: str = "", z: int = 0, x: int = 0, y: int = 0,
                 timeout: float = 30, use_cache: bool = True) -> bytes | None:
-    """下载字节；None 表示 404（无数据）。404 也会被缓存，避免重复请求。"""
+    """下载字节；None 表示无数据（404 或缺数据）。
+
+    无数据(404)会被缓存为 0 字节标记，但带 TTL：过期后重新请求，
+    防止限流导致的瞬时 404 被记成永久无数据。网络异常不缓存（每次回退重试）。"""
     cp = None
     if use_cache and USE_CACHE and kind:
         cp = _cache_path(kind, z, x, y)
         if cp.exists():
             data = cp.read_bytes()
-            return None if data == b"" else data
+            if data == b"":
+                if _cache_age(cp) < NODATA_TTL:
+                    return None  # 仍在有效期内，按无数据处理
+                # 已过期，继续往下重新下载
+            else:
+                return data
     try:
         r = get_session().get(url, timeout=timeout)
         if r.status_code == 404:
             if cp:
                 cp.parent.mkdir(parents=True, exist_ok=True)
-                cp.write_bytes(b"")
+                cp.write_bytes(b"")  # 标记无数据（带 TTL，不是永久）
             return None
         r.raise_for_status()
         data = r.content
@@ -441,6 +458,17 @@ def downsample(a: np.ndarray, max_size: int) -> np.ndarray:
     return a[:nh * f, :nw * f].reshape(nh, f, nw, f).mean(axis=(1, 3))
 
 
+def decimate(a: np.ndarray, f: int) -> np.ndarray:
+    """最近邻整块抽稀（LOD / 网格简化）：每 f 个像素取一个，用于网格顶点数超限时。
+
+    只降网格几何密度，不动纹理（纹理由 --sat-max-size 独立决定），故简化后贴图仍清晰。"""
+    f = max(1, int(f))
+    if f == 1:
+        return a
+    h, w = a.shape
+    return a[::f, ::f][: h // f, : w // f]
+
+
 def encode_terrarium(dem: np.ndarray) -> str:
     """高程 -> Terrarium PNG -> base64（无 data: 前缀）。"""
     v = np.clip(np.round(dem) + 32768.0, 0.0, 65535.0)
@@ -451,6 +479,40 @@ def encode_terrarium(dem: np.ndarray) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True, compress_level=9)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def compute_hillshade(elev: np.ndarray, azimuth: float = 315.0, altitude: float = 45.0,
+                      z_factor: float = 1.0) -> np.ndarray:
+    """经典 ESRI hillshade：返回与 elev 同形的 [0,1] 光照系数（0=无光, 1=正对光源）。
+
+    用于把地形起伏"烤"进卫星贴图，让平面影像也有立体感。"""
+    e = np.pad(elev, 1, mode="edge").astype(np.float32)
+    dzdx = (e[1:-1, 2:] - e[1:-1, :-2]) / 2.0
+    dzdy = (e[2:, 1:-1] - e[:-2, 1:-1]) / 2.0
+    slope = np.arctan(z_factor * np.sqrt(dzdx ** 2 + dzdy ** 2))
+    aspect = np.arctan2(dzdy, -dzdx)
+    zenith = math.radians(90.0 - altitude)
+    az = math.radians(azimuth)
+    shade = (np.cos(zenith) * np.cos(slope)
+             + np.sin(zenith) * np.sin(slope) * np.cos(az - aspect))
+    return np.clip(shade, 0.0, 1.0)
+
+
+def encode_sat(crop: "Image.Image", fmt: str, quality: int) -> tuple[str, str]:
+    """编码卫星纹理：优先 WebP（更小），失败回退 JPEG。返回 (b64, mime)。"""
+    buf = io.BytesIO()
+    mime = "image/jpeg"
+    try:
+        if fmt == "webp":
+            crop.save(buf, format="WEBP", quality=quality, method=4)
+            mime = "image/webp"
+        else:
+            crop.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+    except Exception:
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+        mime = "image/jpeg"
+    return base64.b64encode(buf.getvalue()).decode(), mime
 
 
 # ==================================================================
@@ -611,35 +673,20 @@ def build(args) -> dict:
             "y0": merc_y(lat_n), "y1": merc_y(lat_s)}
     log(f"    · 范围 {width_m / 1000:.2f} × {height_m / 1000:.2f} km  (zoom {zoom}, {grid}×{grid} 瓦片)")
 
-    # ---- 2. DEM ----
-    log(f"[2/5] 下载 DEM 高程瓦片 ({grid * grid} 块)…")
-    dem = mosaic_dem(zoom, tx0, ty0, grid, args.workers)
-    if np.isnan(dem).all():
-        raise RuntimeError("该区域无高程数据（可能位于远海或数据缺失区），请更换地点或降低 zoom。")
-    fill = float(np.nanmin(dem))
-    dem = np.nan_to_num(dem, nan=fill)
-    dem = downsample(dem, args.max_size)
-    H, W = dem.shape
-
-    # 峰值：先在平滑图上定位，再取原始高程，避免噪点誤判
-    sm = box_blur(dem, 2)
-    pj, pi = np.unravel_index(int(np.argmax(sm)), sm.shape)
-    peak_elev = float(dem[pj, pi])
-    log(f"    · 高程 {float(dem.min()):.0f} – {float(dem.max()):.0f} m，主峰 {peak_elev:.0f} m")
-
-    dem_b64 = encode_terrarium(dem)
-
-    # ---- 3. 卫星影像（超采样后精确裁切对齐）----
-    sat_b64, sat_zoom = "", zoom
+    # ---- 2 & 3. DEM 与卫星影像并行下载（网络阶段并发，省首跑时间）----
+    # 影像 zoom 预算（纯数学，只依赖范围，不依赖 DEM），先算好再并发下瓦片
+    sat_zoom, sx0, sy0, nx, ny = zoom, 0, 0, 0, 0
+    fx0, fy0, fx1, fy1 = 0.0, 0.0, 0.0, 0.0
     if not args.no_sat:
-        log("[3/5] 下载卫星影像…")
-        sat_zoom = min(MAX_SAT_ZOOM, zoom + args.sat_extra)
+        span_tiles = max(1e-6, grid * 256.0)  # 该范围在 DEM zoom 下的像素跨度
+        needed = int(math.ceil(math.log2(max(1.0, args.sat_max_size) / span_tiles)))
+        sat_zoom = min(MAX_SAT_ZOOM, zoom + max(args.sat_extra, needed))
         fx0, fx1 = lon_to_tile_x(lon_w, sat_zoom), lon_to_tile_x(lon_e, sat_zoom)
         fy0, fy1 = lat_to_tile_y(lat_n, sat_zoom), lat_to_tile_y(lat_s, sat_zoom)
         while True:
-            nx = int(math.ceil(fx1)) - int(math.floor(fx0))
-            ny = int(math.ceil(fy1)) - int(math.floor(fy0))
-            if nx * ny <= args.max_sat_tiles or sat_zoom <= zoom:
+            nxx = int(math.ceil(fx1)) - int(math.floor(fx0))
+            nyy = int(math.ceil(fy1)) - int(math.floor(fy0))
+            if nxx * nyy <= args.max_sat_tiles or sat_zoom <= zoom:
                 break
             sat_zoom -= 1
             fx0, fx1 = lon_to_tile_x(lon_w, sat_zoom), lon_to_tile_x(lon_e, sat_zoom)
@@ -647,8 +694,48 @@ def build(args) -> dict:
         sx0, sy0 = int(math.floor(fx0)), int(math.floor(fy0))
         nx = int(math.ceil(fx1)) - sx0
         ny = int(math.ceil(fy1)) - sy0
-        log(f"    · 影像 zoom {sat_zoom}，{nx}×{ny} 瓦片")
-        mos = mosaic_sat(sat_zoom, sx0, sy0, nx, ny, args.workers)
+        log(f"    · 影像 zoom {sat_zoom}，{nx}×{ny} 瓦片（与 DEM 并行下载）")
+
+    def _fetch_dem():
+        return mosaic_dem(zoom, tx0, ty0, grid, args.workers)
+
+    def _fetch_sat():
+        return mosaic_sat(sat_zoom, sx0, sy0, nx, ny, args.workers)
+
+    log(f"[2/5] 并行下载 DEM ({grid * grid} 块) + 卫星影像…")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_dem = ex.submit(_fetch_dem)
+        f_sat = ex.submit(_fetch_sat) if not args.no_sat else None
+        dem_raw = f_dem.result()
+        sat_mos = f_sat.result() if f_sat is not None else None
+
+    if np.isnan(dem_raw).all():
+        raise RuntimeError("该区域无高程数据（可能位于远海或数据缺失区），请更换地点或降低 zoom。")
+    fill = float(np.nanmin(dem_raw))
+    dem = np.nan_to_num(dem_raw, nan=fill)
+    dem = downsample(dem, args.max_size)
+
+    # ---- 网格 LOD：顶点数超限时按最近邻抽稀（纹理仍保持 sat_max_size 清晰度）----
+    H0, W0 = dem.shape
+    if W0 * H0 > args.max_verts:
+        f_ = int(math.ceil(math.sqrt(W0 * H0 / args.max_verts)))
+        dem = decimate(dem, f_)
+        log(f"    · 顶点超限 {W0 * H0 / 1e6:.1f}M>{args.max_verts / 1e6:.1f}M，网格按 {f_}× 抽稀为 {dem.shape[1]}×{dem.shape[0]}")
+
+    H, W = dem.shape
+
+    # 峰值：先在平滑图上定位，再取原始高程，避免噪点誤判
+    sm = box_blur(dem, 2)
+    pj, pi = np.unravel_index(int(np.argmax(sm)), sm.shape)
+    peak_elev = float(dem[pj, pi])
+    log(f"    · 高程 {float(dem.min()):.0f} – {float(dem.max()):.0f} m，主峰 {peak_elev:.0f} m（网格 {W}×{H}）")
+
+    dem_b64 = encode_terrarium(dem)
+
+    # ---- 3. 卫星影像后处理（裁切/锐化/hillshade 烤入，依赖 dem 完成）----
+    sat_b64, sat_w, sat_h, sat_mime = "", 0, 0, ""
+    if sat_mos is not None:
+        log("[3/5] 处理卫星影像（裁切/锐化/hillshade）…")
         cx0 = (fx0 - sx0) * 256.0
         cy0 = (fy0 - sy0) * 256.0
         cw = (fx1 - fx0) * 256.0
@@ -656,11 +743,29 @@ def build(args) -> dict:
         box = (int(round(cx0)), int(round(cy0)),
                int(round(cx0 + cw)), int(round(cy0 + ch)))
         box = (max(0, box[0]), max(0, box[1]),
-               min(mos.width, box[2]), min(mos.height, box[3]))
-        mos = mos.crop(box).resize((W, H), Image.LANCZOS)
-        buf = io.BytesIO()
-        mos.save(buf, format="JPEG", quality=args.jpeg_quality, optimize=True, progressive=True)
-        sat_b64 = base64.b64encode(buf.getvalue()).decode()
+               min(sat_mos.width, box[2]), min(sat_mos.height, box[3]))
+        crop = sat_mos.crop(box)
+        # 纹理长边对齐 sat_max_size（与网格 W/H 解耦）
+        long_edge = max(crop.width, crop.height)
+        scale = args.sat_max_size / max(1, long_edge)
+        sat_w = max(2, int(round(crop.width * scale)))
+        sat_h = max(2, int(round(crop.height * scale)))
+        crop = crop.resize((sat_w, sat_h), Image.LANCZOS)
+        # 锐化（微妙提升贴图 crispness）
+        if args.sharpen != 1.0:
+            crop = ImageEnhance.Sharpness(crop).enhance(args.sharpen)
+        # 叠微 hillshade：用 DEM 重采样到纹理尺寸，把起伏"烤"进贴图增强立体感
+        if not args.no_hillshade:
+            shade = compute_hillshade(dem, altitude=args.hillshade_alt)
+            shade = np.asarray(Image.fromarray(shade).resize((sat_w, sat_h), Image.BILINEAR),
+                               dtype=np.float32)
+            k = args.hillshade_strength
+            factor = np.clip((1.0 - 0.5 * k) + k * shade, 0.45, 1.45)
+            arr = np.asarray(crop, dtype=np.float32) * factor[..., None]
+            crop = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+            log(f"    · 已叠 hillshade（强度 {k:.2f}，光照角 {args.hillshade_alt:.0f}°）")
+        sat_b64, sat_mime = encode_sat(crop, args.sat_format, args.jpeg_quality)
+        log(f"    · 影像编码 {sat_mime.split('/')[-1].upper()}，纹理 {sat_w}×{sat_h}")
     else:
         log("[3/5] 跳过卫星影像（--no-sat）")
 
@@ -717,6 +822,9 @@ def build(args) -> dict:
         "merc": merc,  # 像素行号与墨卡托 Y 线性相关，插值必须在墨卡托空间做
         "has_sat": bool(sat_b64),
         "resolution_m": max(width_m, height_m) / max(1, W),
+        "sat_resolution_m": (max(width_m, height_m) / max(1, sat_w) if sat_w else None),
+        "size_sat_w": sat_w,
+        "size_sat_h": sat_h,
         "sources": {
             "dem": "AWS Terrarium (SRTM/GDEM)",
             "sat": "Esri World Imagery" if sat_b64 else "",
@@ -727,7 +835,7 @@ def build(args) -> dict:
 
     log(f"[5/5] 完成，用时 {time.time() - t0:.1f}s")
     return {"meta": meta, "dem_b64": dem_b64, "sat_b64": sat_b64,
-            "sat_mime": "image/jpeg", "landmarks": landmarks}
+            "sat_mime": sat_mime or "image/jpeg", "landmarks": landmarks}
 
 
 def main():
@@ -738,10 +846,19 @@ def main():
     p.add_argument("--lon", type=float, help="直接指定中心经度 WGS84")
     p.add_argument("--zoom", type=int, default=14, help="DEM 瓦片层级 (3-15)")
     p.add_argument("--grid", type=int, default=3, help="瓦片网格数 N（覆盖 N×N 个瓦片）")
-    p.add_argument("--max-size", type=int, default=1024, help="DEM/影像最大边长（像素）")
-    p.add_argument("--sat-extra", type=int, default=2, help="卫星影像超采样级别（zoom+N，更清晰）")
-    p.add_argument("--max-sat-tiles", type=int, default=64, help="影像瓦片数上限（超出则自动降采样级别）")
-    p.add_argument("--jpeg-quality", type=int, default=82, help="影像 JPEG 质量")
+    p.add_argument("--max-size", type=int, default=1024, help="DEM/网格最大边长（像素，控制网格顶点数）")
+    p.add_argument("--max-verts", type=int, default=3000000, help="网格顶点数硬上限（超出则按最近邻抽稀网格，纹理仍保持 sat-max-size 清晰度；防止顶点爆炸）")
+    p.add_argument("--sat-max-size", type=int, default=2048,
+                   help="卫星影像纹理最大边长（像素，独立于网格，决定贴图清晰度；越大越清晰、体积越大）")
+    p.add_argument("--sat-extra", type=int, default=2, help="卫星影像额外超采样下限（zoom+N，作为清晰度下限）")
+    p.add_argument("--max-sat-tiles", type=int, default=576, help="影像瓦片数上限（超出则自动降低 zoom 控体积）")
+    p.add_argument("--sat-format", default="jpeg", choices=["webp", "jpeg"],
+                   help="影像编码：jpeg=默认(体积小、兼容好)；webp=对平滑/照片类常更小，但叠加 hillshade 的高熵纹理下可能反而更大，按需选用")
+    p.add_argument("--jpeg-quality", type=int, default=85, help="影像质量（webp/jpeg 通用，70-95）")
+    p.add_argument("--sharpen", type=float, default=1.3, help="纹理锐化强度（1.0=不锐化，>1 更锐）")
+    p.add_argument("--no-hillshade", action="store_true", help="不叠加 hillshade 立体光照")
+    p.add_argument("--hillshade-strength", type=float, default=0.5, help="hillshade 强度（0-1，越大越立体）")
+    p.add_argument("--hillshade-alt", type=float, default=45.0, help="hillshade 光源高度角（度）")
     p.add_argument("--landmarks", type=int, default=12, help="最多地标数")
     p.add_argument("--no-sat", action="store_true", help="不下载卫星影像")
     p.add_argument("--no-landmarks", action="store_true", help="不获取地标")
@@ -773,7 +890,9 @@ def main():
     log(f"    中心      {m['center_lat']:.5f}, {m['center_lon']:.5f}")
     log(f"    覆盖      {m['width_m']:.0f} × {m['height_m']:.0f} m")
     log(f"    高程      {m['min_elev']:.0f} – {m['max_elev']:.0f} m，主峰 {m['peak_elev']:.0f} m")
-    log(f"    网格      {m['size_w']}×{m['size_h']}，分辨率 {m['resolution_m']:.1f} m/px")
+    log(f"    网格      {m['size_w']}×{m['size_h']}，高程分辨率 {m['resolution_m']:.1f} m/px")
+    if m.get('sat_resolution_m'):
+        log(f"    影像纹理  {m['size_sat_w']}×{m['size_sat_h']}，贴图分辨率 {m['sat_resolution_m']:.2f} m/px")
     log(f"    地标      {len(data['landmarks'])} 个")
 
     if args.out_html:
