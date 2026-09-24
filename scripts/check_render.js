@@ -84,24 +84,54 @@ function serve(dir) {
   page.on('pageerror', e => { if (!ignorable(e.message)) logs.push('[pageerror] ' + e.message); });
 
   await page.goto(url, { waitUntil: 'load', timeout: 60000 });
-  await page.waitForTimeout(9000);
+  // 等页面自己宣告"构建完成"（window.__geo3dReady），比死等 9 秒更准也更稳
+  try {
+    await page.waitForFunction(() => window.__geo3dReady === true, null, { timeout: 30000 });
+  } catch (e) { /* 超时就走下面的断言，让状态如实反映出来 */ }
+  await page.waitForTimeout(1500);
 
   const state = await page.evaluate(() => {
     const c = document.querySelector('canvas');
     const l = document.getElementById('loading');
+    const shown = sel => Array.from(document.querySelectorAll(sel)).filter(e => e.style.display === 'block').length;
     return {
       hasCanvas: !!c,
       canvasSize: c ? c.width + 'x' + c.height : null,
       loadingHidden: l ? l.classList.contains('hide') : null,
       statusText: (document.getElementById('lmsg') || {}).textContent || '',
-      visibleLabels: Array.from(document.querySelectorAll('.lbl')).filter(e => e.style.display === 'block').length,
+      visibleLabels: shown('.lbl'),
+      // v2.5: GeoJSON 叠加图层的标签（有叠加图形时不应为 0）
+      ovLabelsTotal: document.querySelectorAll('.ovl').length,
+      ovLabelsVisible: shown('.ovl'),
+      // v2.9: 构建完成标记 + 建地形那一刻纹理是否已就绪
+      // （按需渲染下若纹理晚于首帧就绪，画面会一直发暗且不会自己重绘）
+      ready: window.__geo3dReady === true,
+      texReady: window.__geo3dTexReady === true,
+      // v2.10: 地形实际贴到的纹理尺寸（分块合成时 = 等效大纹理，如 [6592, 8192]）
+      texSize: (window.__geo3dDebug && window.__geo3dDebug.texSize) || null,
+      // v2.9 业务工具是否就位
+      hasTools: ['measBtn', 'profBtn', 'glbBtn', 'clrBtn', 'scaleTx', 'needle', 'cursor']
+        .every(id => !!document.getElementById(id)),
+      // v2.9 各向同性检查：世界平面的宽高比必须等于地面范围的宽高比，
+      // 否则 x/z 两个方向的「米/世界单位」不等，垂直夸张会在长边方向被压平、短边被拔高
+      plane: window.__geo3dDebug ? (() => {
+        const D = window.__geo3dDebug;
+        return { WX: +D.WX.toFixed(2), WZ: +D.WZ.toFixed(2),
+                 planeRatio: +(D.WX / D.WZ).toFixed(4),
+                 rangeRatio: +(D.META.width_m / D.META.height_m).toFixed(4) };
+      })() : null,
     };
   });
   if (shot) await page.screenshot({ path: shot });
   await browser.close();
   if (srv) srv.close();
 
-  const ok = state.hasCanvas && state.loadingHidden === true && logs.length === 0;
+  // 平面宽高比与地面范围宽高比必须一致（容差 1%，浮点与取整余量）
+  const iso = !state.plane
+    || Math.abs(state.plane.planeRatio - state.plane.rangeRatio) <= 0.01 * Math.max(1, state.plane.rangeRatio);
+  const ok = state.hasCanvas && state.loadingHidden === true
+    && state.ready === true && state.hasTools === true
+    && iso && logs.length === 0;
   console.log(JSON.stringify({ ok, ...state, errors: logs }, null, 2));
   process.exit(ok ? 0 : 1);
 })();
